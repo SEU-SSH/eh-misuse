@@ -1,0 +1,1 @@
+/home/ziyufeiyu111/llvm-project/build/bin/clang++ -fPIC -std=c++17 -fpic -fno-rtti -g -shared -Wl,-soname,libAnalyzer.so -o libAnalyzer.so CMakeFiles/AnalyzerObj.dir/Common.cc.o CMakeFiles/AnalyzerObj.dir/Analyzer.cc.o CMakeFiles/AnalyzerObj.dir/CallGraph.cc.o CMakeFiles/AnalyzerObj.dir/Taint.cc.o 
