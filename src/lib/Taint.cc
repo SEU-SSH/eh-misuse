@@ -534,6 +534,7 @@ bool TaintPass::InterproceduralErrorAnalysis(Function *F) {
     return false;
 }
 
+/*
 void TaintPass::BuildLocalErrorCFG(Function *TargetFunc) {
     errs() << "Building local CFG for error propagation in " << TargetFunc->getName() << ":\n";
     
@@ -567,6 +568,228 @@ void TaintPass::BuildLocalErrorCFG(Function *TargetFunc) {
             }
         }
     }
+}*/
+
+void TaintPass::BuildLocalErrorCFG(Function *F) {
+    errs() << "Analyzing error handling checks in function: " << F->getName() << ":\n";
+    
+    // Map to store sources (variables that receive error return values)
+    std::map<Value*, CallInst*> ErrorReturnSources;
+    std::set<Value*> TaintedValues;
+    std::set<Instruction*> ErrorValidations; // These are our sinks
+    bool foundErrorHandleCheck = false;
+    
+    // Step 1: Find all calls to error return functions as our taint sources
+    for (auto &BB : *F) {
+        for (auto &I : BB) {
+            if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+                Function *Callee = CI->getCalledFunction();
+                bool isErrorReturnCall = false;
+                
+                // Direct calls to known error return functions
+                if (Callee && Ctx->ErrorReturnFuncs.count(Callee)) {
+                    errs() << "  Found call to error return function: " << Callee->getName() << "\n";
+                    Ctx->addErrorPropagationEdge(Callee, F, CI);
+                    isErrorReturnCall = true;
+                } 
+                // Indirect calls through function pointers
+                else if (!Callee) {
+                    auto Callees = Ctx->Callees.find(CI);
+                    if (Callees != Ctx->Callees.end()) {
+                        for (Function *PotentialCallee : Callees->second) {
+                            if (Ctx->ErrorReturnFuncs.count(PotentialCallee)) {
+                                errs() << "  Found indirect call to error return function: " 
+                                      << PotentialCallee->getName() << "\n";
+                                Ctx->addErrorPropagationEdge(PotentialCallee, F, CI);
+                                isErrorReturnCall = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Track return values of error functions as taint sources
+                if (isErrorReturnCall && !CI->getType()->isVoidTy()) {
+                    ErrorReturnSources[CI] = CI;
+                    TaintedValues.insert(CI);
+                    
+                    errs() << "  Found error value source at ";
+                    printConsistentDebugLoc(CI);
+                    errs() << "\n";
+                }
+            }
+        }
+    }
+    
+    // If no error return sources, return directly
+    if (ErrorReturnSources.empty()) {
+        errs() << "  No error return sources found in function\n";
+        return;
+    }
+    
+    errs() << "Found " << ErrorReturnSources.size() << " error return sources in function " 
+           << F->getName() << ", running taint analysis...\n";
+    
+    // Step 2: Perform taint analysis
+    std::queue<Value*> WorkList;
+    for (auto &Source : ErrorReturnSources) {
+        WorkList.push(Source.first);
+    }
+    
+    // Execute taint propagation
+    while (!WorkList.empty()) {
+        Value *TaintedValue = WorkList.front();
+        WorkList.pop();
+        
+        // Iterate through all instructions using this value
+        for (User *U : TaintedValue->users()) {
+            if (Instruction *I = dyn_cast<Instruction>(U)) {
+                // Skip if instruction is not in the current function
+                if (I->getFunction() != F) continue;
+                
+                // Skip if instruction is already tainted
+                if (TaintedValues.count(I)) continue;
+                
+                bool NewTaint = false;
+                
+                // Taint propagation logic for different instruction types
+                if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+                    // Load instruction: if pointer is tainted, result is tainted
+                    if (LI->getPointerOperand() == TaintedValue) {
+                        NewTaint = true;
+                    }
+                } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+                    // Store instruction: if value is tainted, pointer is tainted
+                    if (SI->getValueOperand() == TaintedValue) {
+                        Value *Ptr = SI->getPointerOperand();
+                        if (!TaintedValues.count(Ptr)) {
+                            TaintedValues.insert(Ptr);
+                            WorkList.push(Ptr);
+                        }
+                    }
+                } else if (CastInst *CI = dyn_cast<CastInst>(I)) {
+                    // Type cast instructions always propagate taint
+                    NewTaint = true;
+                } else if (PHINode *PHI = dyn_cast<PHINode>(I)) {
+                    // PHI node: if any input is tainted, result is tainted
+                    for (unsigned i = 0; i < PHI->getNumIncomingValues(); i++) {
+                        if (PHI->getIncomingValue(i) == TaintedValue) {
+                            NewTaint = true;
+                            break;
+                        }
+                    }
+                } else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(I)) {
+                    // GEP instruction: if base pointer is tainted, result is tainted
+                    if (GEP->getPointerOperand() == TaintedValue) {
+                        NewTaint = true;
+                    }
+                } else if (CallInst *CallI = dyn_cast<CallInst>(I)) {
+                    // Special handling for error validation functions
+                    Function *Callee = CallI->getCalledFunction();
+                    if (Callee) {
+                        StringRef Name = Callee->getName();
+                        // Check for common error validation functions
+                        if (Name.contains("IS_ERR") || Name.contains("PTR_ERR") || 
+                            Name.contains("ERR_PTR") || Name.contains("IS_ERR_OR_NULL")) {
+                            
+                            // Check if tainted value is passed to this function
+                            for (unsigned i = 0; i < CallI->arg_size(); i++) {
+                                if (CallI->getArgOperand(i) == TaintedValue) {
+                                    // Found validation of tainted value - this is a sink
+                                    ErrorValidations.insert(CallI);
+                                    foundErrorHandleCheck = true;
+                                    errs() << "  Found error validation function at ";
+                                    printConsistentDebugLoc(CallI);
+                                    errs() << "\n";
+                                    
+                                    // The result of this call is also tainted
+                                    NewTaint = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Normal taint propagation for function calls
+                    for (unsigned i = 0; i < CallI->arg_size(); i++) {
+                        if (CallI->getArgOperand(i) == TaintedValue) {
+                            // If call has return value, it becomes tainted
+                            if (!CallI->getType()->isVoidTy()) {
+                                NewTaint = true;
+                            }
+                            break;
+                        }
+                    }
+                } else if (ICmpInst *Cmp = dyn_cast<ICmpInst>(I)) {
+                    // Comparisons involving tainted values - these are our main sinks
+                    if (Cmp->getOperand(0) == TaintedValue || Cmp->getOperand(1) == TaintedValue) {
+                        // This comparison is an error validation - it's a sink
+                        ErrorValidations.insert(Cmp);
+                        foundErrorHandleCheck = true;
+                        
+                        // Check type of comparison for better error reporting
+                        if (ConstantInt *CI = dyn_cast<ConstantInt>(Cmp->getOperand(0))) {
+                            if (CI->isZero() || CI->isNegative()) {
+                                errs() << "  Found error check comparison at ";
+                                printConsistentDebugLoc(Cmp);
+                                errs() << "\n";
+                            }
+                        }
+                        else if (ConstantInt *CI = dyn_cast<ConstantInt>(Cmp->getOperand(1))) {
+                            if (CI->isZero() || CI->isNegative()) {
+                                errs() << "  Found error check comparison at ";
+                                printConsistentDebugLoc(Cmp);
+                                errs() << "\n";
+                            }
+                        }
+                        else {
+                            errs() << "  Found comparison with tainted value at ";
+                            printConsistentDebugLoc(Cmp);
+                            errs() << "\n";
+                        }
+                        
+                        // The comparison result is also tainted
+                        NewTaint = true;
+                    }
+                } else if (BinaryOperator *BinOp = dyn_cast<BinaryOperator>(I)) {
+                    // Binary operations: if any operand is tainted, result is tainted
+                    if (BinOp->getOperand(0) == TaintedValue || 
+                        BinOp->getOperand(1) == TaintedValue) {
+                        NewTaint = true;
+                    }
+                } else {
+                    // Other instructions: if any operand is tainted, result is tainted
+                    for (Use &U : I->operands()) {
+                        if (U.get() == TaintedValue) {
+                            NewTaint = true;
+                            break;
+                        }
+                    }
+                }
+                
+                // If instruction is newly tainted, add to work queue
+                if (NewTaint) {
+                    TaintedValues.insert(I);
+                    WorkList.push(I);
+                }
+            }
+        }
+    }
+    
+    // Step 3: Analyze the control flow based on error validations
+    for (Instruction *Validation : ErrorValidations) {
+        // Find branches controlled by this validation
+        errs() << "  Error validation at ";
+        printConsistentDebugLoc(Validation);
+    }
+    
+    // Step 4: Output analysis results
+    errs() << "\n--- Error Handle Check Analysis Results for function: " << F->getName() << " ---\n";
+    errs() << "Total error return sources: " << ErrorReturnSources.size() << "\n";
+    errs() << "Total tainted values: " << TaintedValues.size() << "\n";
+    errs() << "Error validation points: " << ErrorValidations.size() << "\n";
+    
+    errs() << "--- End of Error Handle Check Analysis ---\n\n";
 }
 
 bool TaintPass::doInitialization(Module *M) {
